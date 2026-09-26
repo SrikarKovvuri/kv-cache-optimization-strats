@@ -11,8 +11,28 @@ quality tradeoffs each one makes.
 
 ## Setup
 
-You need **Python 3.10+**. From the repository root, create a virtual
-environment and install dependencies:
+You need **Python 3.10+**. Pick **one** of the two setups below.
+
+### On the course server (`mv.cs.columbia.edu`)
+
+**Do not create a virtual environment or `pip install` anything on the course
+server.** A ready-made environment with torch, transformers, and the TinyLlama
+weights is shared for the whole class, and your disk quota there is small
+(500 MB soft / 1 GB hard), so installing torch yourself will fail and can leave
+your account over quota. Load the shared environment instead:
+
+```bash
+source /home/coms6998-shared/env.sh
+```
+
+The model does not fit on the login node, so run it on the GPU through Slurm
+(`srun` or `sbatch`, at most 15 minutes per job). See the "Course Server Access"
+post on Ed for the exact commands.
+
+### On your own computer
+
+From the repository root, create a virtual environment and install
+dependencies:
 
 ```bash
 python3 -m venv .venv
@@ -21,9 +41,10 @@ pip install --upgrade pip
 pip install -r code/requirements.txt
 ```
 
-Run the server with the venv activated (e.g.
+Run the server with the environment loaded (e.g.
 `python code/less_minimal_full_server.py --verbose`). A CUDA GPU is optional
-but recommended for timing runs; `--device cpu` works for debugging.
+but recommended for timing runs; `--device cpu` works for debugging on your own
+computer.
 
 ## Starting Code
 
