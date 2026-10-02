@@ -3,9 +3,16 @@
 Five-step TinyLlama inference (same skeleton as minimal_full_server.py from week-2).
 
 --verbose unwraps model() into RMSNorm, Q/K/V, RoPE, GQA, attention, SwiGLU.
+
+KV compression:
+  window     --window-size W        last W positions per layer
+  importance --importance-budget B   top-B positions by cumulative attention (requires --verbose)
+  quant      per-KV-head INT8 K/V + scales (requires --verbose)
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 import argparse
 import math
@@ -35,6 +42,106 @@ def decode_answer(tokenizer, token_ids) -> str:
     return text.strip()
 
 
+# Sliding-window KV trim (transformers>=4.56 per requirements.txt):
+# DynamicCache.layers[i].keys / .values, shape [B, H_kv, S, D_h].
+def apply_window(k: torch.Tensor, v: torch.Tensor, window_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if k.shape[-2] <= window_size:
+        return k, v
+    return k[:, :, -window_size:, :], v[:, :, -window_size:, :]
+
+
+def write_window_to_layer(
+    kv_cache: DynamicCache, layer_idx: int, k: torch.Tensor, v: torch.Tensor, window_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep last W positions in the cache layer; return trimmed K/V for attention."""
+    k, v = apply_window(k, v, window_size)
+    layer = kv_cache.layers[layer_idx]
+    layer.keys = k
+    layer.values = v
+    return k, v
+
+
+def trim_all_layers_window(kv_cache: DynamicCache, window_size: int) -> None:
+    for layer_idx, layer in enumerate(kv_cache.layers):
+        write_window_to_layer(kv_cache, layer_idx, layer.keys, layer.values, window_size)
+
+
+def evict_by_importance(
+    kv_cache: DynamicCache,
+    layer_idx: int,
+    importance: torch.Tensor,
+    budget: int,
+) -> torch.Tensor:
+    """Keep top-`budget` positions by score; survivors stay in chronological order."""
+    if importance.shape[0] <= budget:
+        return importance
+    keep_idx = torch.topk(importance, k=budget, largest=True).indices
+    keep_idx = torch.sort(keep_idx).values
+    layer = kv_cache.layers[layer_idx]
+    layer.keys = layer.keys[:, :, keep_idx, :]
+    layer.values = layer.values[:, :, keep_idx, :]
+    return importance[keep_idx]
+
+
+def kv_cache_storage_bytes(kv_cache: DynamicCache) -> int:
+    total = 0
+    for layer in kv_cache.layers:
+        total += layer.keys.numel() * layer.keys.element_size()
+        total += layer.values.numel() * layer.values.element_size()
+    return total
+
+
+# Per-layer INT8 cache: qk/qv [B, H_kv, S, D_h], k_scale/v_scale [B, H_kv, 1, 1].
+QuantLayer = dict[str, torch.Tensor]
+
+
+def quantize_per_head(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    max_abs = x.abs().amax(dim=(-2, -1), keepdim=True)
+    scale = torch.clamp(max_abs / 127.0, min=1e-8)
+    qx = torch.round(x / scale).clamp(-127, 127).to(torch.int8)
+    return qx, scale
+
+
+def dequantize(qx: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return qx.to(scale.dtype) * scale
+
+
+def store_quant_layer(k: torch.Tensor, v: torch.Tensor) -> QuantLayer:
+    qk, k_scale = quantize_per_head(k)
+    qv, v_scale = quantize_per_head(v)
+    return {"qk": qk, "k_scale": k_scale, "qv": qv, "v_scale": v_scale}
+
+
+def dequantize_layer(entry: QuantLayer) -> tuple[torch.Tensor, torch.Tensor]:
+    k = dequantize(entry["qk"], entry["k_scale"])
+    v = dequantize(entry["qv"], entry["v_scale"])
+    return k, v
+
+
+def append_requant_quant_layer(entry: QuantLayer, k_new: torch.Tensor, v_new: torch.Tensor) -> QuantLayer:
+    old_k, old_v = dequantize_layer(entry)
+    k_full = torch.cat([old_k, k_new], dim=-2)
+    v_full = torch.cat([old_v, v_new], dim=-2)
+    return store_quant_layer(k_full, v_full)
+
+
+def quant_cache_seq_len(quant_cache: list[QuantLayer | None]) -> int:
+    for entry in quant_cache:
+        if entry is not None:
+            return entry["qk"].shape[-2]
+    return 0
+
+
+def quant_cache_storage_bytes(quant_cache: list[QuantLayer | None]) -> int:
+    total = 0
+    for entry in quant_cache:
+        if entry is None:
+            continue
+        for tensor in entry.values():
+            total += tensor.numel() * tensor.element_size()
+    return total
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Minimal full-server LLM inference")
     parser.add_argument("--model", default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
@@ -48,7 +155,55 @@ def main() -> None:
         "(the decode loop runs at most this many minus 1)",
     )
     parser.add_argument("--verbose", action="store_true", help="Unwrap model() layer by layer")
+    parser.add_argument(
+        "--compression",
+        choices=("none", "window", "importance", "quant"),
+        default="none",
+        help="KV cache compression (default: none)",
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=None,
+        metavar="W",
+        help="Sliding window: max KV positions kept per layer after trim (requires --compression window)",
+    )
+    parser.add_argument(
+        "--importance-budget",
+        type=int,
+        default=None,
+        metavar="B",
+        help="Importance eviction: max KV positions per layer by cumulative attention "
+        "(requires --compression importance and --verbose)",
+    )
     args = parser.parse_args()
+
+    if args.compression == "window":
+        if args.window_size is None:
+            print("error: --compression window requires --window-size W", file=sys.stderr)
+            sys.exit(2)
+        if args.window_size < 1:
+            print("error: --window-size must be >= 1", file=sys.stderr)
+            sys.exit(2)
+    elif args.compression == "importance":
+        if args.importance_budget is None:
+            print("error: --compression importance requires --importance-budget B", file=sys.stderr)
+            sys.exit(2)
+        if args.importance_budget < 1:
+            print("error: --importance-budget must be >= 1", file=sys.stderr)
+            sys.exit(2)
+        if not args.verbose:
+            print("error: --compression importance requires --verbose (attention weights)", file=sys.stderr)
+            sys.exit(2)
+    elif args.compression == "quant":
+        if not args.verbose:
+            print("error: --compression quant requires --verbose (INT8 KV cache path)", file=sys.stderr)
+            sys.exit(2)
+    else:
+        if args.window_size is not None:
+            print("note: --window-size ignored unless --compression window", file=sys.stderr)
+        if args.importance_budget is not None:
+            print("note: --importance-budget ignored unless --compression importance", file=sys.stderr)
 
     prompt = args.prompt
     if prompt is None:
@@ -82,6 +237,15 @@ def main() -> None:
     print(f"    device={args.device}, dtype={dtype}")
     print(f"    d_model={d_model}, layers={n_layers}, heads={num_heads}, kv_heads={num_kv_heads}, head_dim={head_dim}")
     print(f"    GQA: {num_heads} query heads share {num_kv_heads} KV heads ({num_heads // num_kv_heads}x smaller KV cache than MHA)")
+    print(f"    compression={args.compression}", end="")
+    if args.compression == "window":
+        print(f", window_size={args.window_size}")
+    elif args.compression == "importance":
+        print(f", importance_budget={args.importance_budget}")
+    elif args.compression == "quant":
+        print(", int8 per-KV-head")
+    else:
+        print()
     print(f"    load time={(time.perf_counter() - t0) * 1000:.0f} ms")
 
     # --- 2) Receive prompt ---
@@ -99,11 +263,17 @@ def main() -> None:
     # --- 3) Prefill + KV cache ---
     print("\n[3] Prefill + KV cache")
     t_prefill = time.perf_counter()
+    # Per-layer cumulative attention scores (aligned 1:1 with cached K/V positions).
+    importance: list[torch.Tensor | None] = [None] * n_layers
+    quant_cache: list[QuantLayer | None] = [None] * n_layers
+    kv_cache: DynamicCache | Any = None
 
     if not args.verbose:
         with torch.no_grad():
             outputs = model(input_ids=input_ids, use_cache=True, return_dict=True)
         kv_cache = outputs.past_key_values
+        if args.compression == "window":
+            trim_all_layers_window(kv_cache, args.window_size)
         next_token_id = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
     else:
         print("    --- unwrap model(): layer-by-layer prefill ---")
@@ -115,7 +285,8 @@ def main() -> None:
 
             causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=args.device)).bool()
             position_ids = torch.arange(seq_len, device=args.device).unsqueeze(0)
-            kv_cache = DynamicCache()
+            if args.compression != "quant":
+                kv_cache = DynamicCache()
 
             # 2. LOOP THROUGH ALL LAYERS MANUALLY
             for layer_idx, layer in enumerate(model.model.layers):
@@ -134,8 +305,10 @@ def main() -> None:
                 cos, sin = model.model.rotary_emb(v, position_ids)
                 q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-                # Append K and V into the DynamicCache object
-                kv_cache.update(k, v, layer_idx)
+                if args.compression == "quant":
+                    quant_cache[layer_idx] = store_quant_layer(k, v)
+                else:
+                    kv_cache.update(k, v, layer_idx)
 
                 # Handle Grouped-Query Attention (GQA) expansion
                 if num_kv_heads < num_heads:
@@ -149,6 +322,12 @@ def main() -> None:
                 scores = scores.masked_fill(~causal_mask, float("-inf"))
                 attn_weights = torch.softmax(scores, dim=-1)
                 attn_output = torch.matmul(attn_weights, v_exp)
+
+                if args.compression == "importance":
+                    layer_importance = attn_weights.sum(dim=(0, 1, 2))
+                    importance[layer_idx] = evict_by_importance(
+                        kv_cache, layer_idx, layer_importance, args.importance_budget
+                    )
 
                 # Output Projection + Residual Add
                 attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
@@ -167,6 +346,8 @@ def main() -> None:
             # 3. Final RMSNorm + LM head
             logits = model.lm_head(model.model.norm(hidden_states))
             next_token_id = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            if args.compression == "window":
+                trim_all_layers_window(kv_cache, args.window_size)
 
     if args.device.startswith("cuda"):
         torch.cuda.synchronize()
@@ -176,13 +357,20 @@ def main() -> None:
         with torch.no_grad():
             ref_id = model(input_ids=input_ids, use_cache=False, return_dict=True).logits[:, -1, :].argmax(dim=-1)
         print(f"    * First token matches HuggingFace model(): {ref_id.item() == next_token_id.item()}")
-    seq = kv_seq_len(kv_cache)
+    if args.compression == "quant":
+        seq = quant_cache_seq_len(quant_cache)
+    else:
+        seq = kv_seq_len(kv_cache)
     gqa = kv_bytes(n_layers, num_kv_heads, seq, head_dim, 1, kv_itemsize)
     mha = kv_bytes(n_layers, num_heads, seq, head_dim, 1, kv_itemsize)
     first_text = tokenizer.decode(next_token_id[0], skip_special_tokens=False)
     print(f"    prefill time={prefill_ms:.1f} ms")
     print(f"    KV cache seq_len={seq}")
-    print(f"    KV cache {gqa / 1024:.1f} KB (GQA) vs {mha / 1024:.1f} KB if MHA")
+    print(f"    KV cache {gqa / 1024:.1f} KB (GQA dense formula) vs {mha / 1024:.1f} KB if MHA")
+    if args.compression == "quant":
+        print(f"    KV cache stored bytes={quant_cache_storage_bytes(quant_cache) / 1024:.1f} KB (INT8 + scales)")
+    elif args.compression != "none":
+        print(f"    KV cache stored bytes={kv_cache_storage_bytes(kv_cache) / 1024:.1f} KB (actual tensors)")
     print(f"    first output token id={next_token_id.item()} piece={first_text!r}  (one word may take several tokens)")
 
     # --- 4) Autoregressive decode ---
@@ -204,6 +392,8 @@ def main() -> None:
             if not args.verbose:
                 outputs = model(input_ids=next_token_id, past_key_values=kv_cache, use_cache=True, return_dict=True)
                 kv_cache = outputs.past_key_values
+                if args.compression == "window":
+                    trim_all_layers_window(kv_cache, args.window_size)
                 next_token_id = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             else:
                 # Same block as prefill, but Q has seq=1 and attends to the full cache
@@ -228,8 +418,26 @@ def main() -> None:
                     cos, sin = model.model.rotary_emb(v_new, position_ids)
                     q, k_new = apply_rotary_pos_emb(q, k_new, cos, sin)
 
-                    # Append K and V into the DynamicCache object
-                    k_full, v_full = kv_cache.update(k_new, v_new, layer_idx)
+                    if args.compression == "quant":
+                        entry = quant_cache[layer_idx]
+                        assert entry is not None
+                        quant_cache[layer_idx] = append_requant_quant_layer(entry, k_new, v_new)
+                        k_full, v_full = dequantize_layer(quant_cache[layer_idx])
+                    else:
+                        k_full, v_full = kv_cache.update(k_new, v_new, layer_idx)
+                    if args.compression == "window":
+                        k_full, v_full = write_window_to_layer(
+                            kv_cache, layer_idx, k_full, v_full, args.window_size
+                        )
+                    elif args.compression == "importance":
+                        imp = importance[layer_idx]
+                        assert imp is not None
+                        importance[layer_idx] = torch.cat(
+                            [
+                                imp,
+                                torch.zeros(1, device=imp.device, dtype=imp.dtype),
+                            ]
+                        )
 
                     # Handle Grouped-Query Attention (GQA) expansion
                     if num_kv_heads < num_heads:
@@ -240,7 +448,21 @@ def main() -> None:
 
                     # Scaled Dot-Product Attention (no mask: the new token may attend to all cached positions)
                     scores = torch.matmul(q, k_exp.transpose(-2, -1)) * attn_scale
-                    attn_output = torch.matmul(torch.softmax(scores, dim=-1), v_exp)
+                    attn_weights = torch.softmax(scores, dim=-1)
+                    attn_output = torch.matmul(attn_weights, v_exp)
+
+                    if args.compression == "importance":
+                        step_importance = attn_weights.mean(dim=(0, 1, 2))
+                        importance[layer_idx] = importance[layer_idx] + step_importance
+                        if importance[layer_idx].shape[0] > args.importance_budget:
+                            importance[layer_idx] = evict_by_importance(
+                                kv_cache,
+                                layer_idx,
+                                importance[layer_idx],
+                                args.importance_budget,
+                            )
+                            layer_cache = kv_cache.layers[layer_idx]
+                            k_full, v_full = layer_cache.keys, layer_cache.values
 
                     # Output Projection + Residual Add
                     attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, 1, d_model)
@@ -262,9 +484,10 @@ def main() -> None:
         generated.append(token_id)
         piece = tokenizer.decode([token_id], skip_special_tokens=False)
         so_far = tokenizer.decode(generated, skip_special_tokens=True)
+        cache_len = quant_cache_seq_len(quant_cache) if args.compression == "quant" else kv_seq_len(kv_cache)
         print(
             f"    step {step + 1:2d}: id={token_id:6d}  "
-            f"piece={piece!r}  text so far={so_far!r}  kv_len={kv_seq_len(kv_cache)}"
+            f"piece={piece!r}  text so far={so_far!r}  kv_len={cache_len}"
         )
         if token_id == eos_id:
             print("    (EOS — stopping decode)")
