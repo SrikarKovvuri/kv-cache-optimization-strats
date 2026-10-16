@@ -117,7 +117,6 @@ def dequantize_layer(entry: QuantLayer) -> tuple[torch.Tensor, torch.Tensor]:
     v = dequantize(entry["qv"], entry["v_scale"])
     return k, v
 
-
 def append_requant_quant_layer(entry: QuantLayer, k_new: torch.Tensor, v_new: torch.Tensor) -> QuantLayer:
     old_k, old_v = dequantize_layer(entry)
     k_full = torch.cat([old_k, k_new], dim=-2)
